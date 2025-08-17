@@ -1,42 +1,42 @@
-from flask import Flask, render_template_string, request
+from flask import Flask, render_template_string, request, send_from_directory
 import orjson, html
 from pathlib import Path
 import numpy as np
 from sentence_transformers import SentenceTransformer
+import json
 
-TOP_K = 4           # max results to show
-WIN_SECONDS = 20.0   # suppress near-duplicates within this window per file
-MIN_TOTAL = 0.18     # overall score floor
-MIN_SEM = 0.30       # semantic floor when there’s no keyword hit
-KW_WEIGHT = 0.35     # weight of keyword score
-SEM_WEIGHT = 0.65    # weight of semantic score
+# ---------- Config ----------
+CFG_PATH = Path("config.json")
+CFG = {
+    "TOP_K": 5,
+    "WIN_SECONDS": 30.0,
+    "MIN_TOTAL": 0.25,
+    "MIN_SEM": 0.40,
+    "KW_WEIGHT": 0.45,
+    "SEM_WEIGHT": 0.55,
+    "CONTEXT_BEFORE": 1,
+    "CONTEXT_AFTER": 1,
+    "EARLY_TIME_BONUS_SEC": 60.0,
+    "EARLY_BONUS": 0.05,
+}
+if CFG_PATH.exists():
+    CFG.update(json.loads(CFG_PATH.read_text(encoding="utf-8")))
 
-
-
+# ---------- Paths ----------
 INDEX_PATH = Path("index/search_index.json")
+EMB_PATH = Path("index/embeddings.npz")
 MEDIA_BASE_URL = "/media/"  # served by Flask static route below
+CAPTIONS_DIR = Path("data/captions")
 
+# ---------- Flask ----------
 app = Flask(__name__, static_folder="data/media", static_url_path="/media")
 
-def load_resources():
-    data = {"docs": []}
-    if INDEX_PATH.exists():
-        data = orjson.loads(INDEX_PATH.read_bytes())
+# Serve captions (WebVTT) if present
+@app.route("/captions/<path:filename>")
+def captions(filename):
+    return send_from_directory(CAPTIONS_DIR, filename)
 
-    emb_path = Path("index/embeddings.npz")
-    embs = None
-    if emb_path.exists():
-        npz = np.load(emb_path)
-        embs = npz["embeddings"]
-
-    # lazy-load model if embeddings exist (for query encoding)
-    model = None
-    if embs is not None:
-        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    return data, embs, model
-
-DATA, EMBEDDINGS, SEM_MODEL = load_resources()
-
+# ---------- HTML ----------
 HTML_TMPL = """
 <!doctype html>
 <title>GAAST Multimedia Search (MVP)</title>
@@ -48,6 +48,7 @@ HTML_TMPL = """
   .item{padding:1rem;border:1px solid #eee;border-radius:.75rem;margin:.5rem 0}
   .ts{font-size:.9rem;color:#666}
   .hit{background:#fffbcc}
+  .row{display:flex;gap:1rem;align-items:center;flex-wrap:wrap}
 </style>
 <h1>GAAST Multimedia Search — MVP</h1>
 <form method="GET">
@@ -62,14 +63,38 @@ HTML_TMPL = """
       <div><strong>{{r.media_file}}</strong></div>
       <div class="ts">{{r.start}}s → {{r.end}}s</div>
       <div>{{r.snippet|safe}}</div>
-      <div style="margin-top:.5rem">
+      <div class="row" style="margin-top:.5rem">
         <a href="{{r.play_url}}" target="_blank">▶ Play from {{r.start}}s</a>
+        <a href="{{r.deep_link}}" target="_blank">Open player</a>
+        <button onclick="navigator.clipboard.writeText(window.location.origin + '{{r.deep_link}}'); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy link',1200);">Copy link</button>
+        {% if r.captions %}
+          <a href="{{r.captions}}" target="_blank">Captions (VTT)</a>
+        {% endif %}
       </div>
     </div>
   {% endfor %}
 {% endif %}
 """
 
+PLAYER_TMPL = """
+<!doctype html>
+<title>Player</title>
+<style>
+  body{font-family:system-ui,Arial,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem}
+  video,audio{width:100%;max-width:900px}
+</style>
+<h2>{{fname}}</h2>
+{% if is_video %}
+<video controls autoplay src="{{src}}#t={{t}}">
+  <track kind="subtitles" src="{{vtt}}" default>
+</video>
+{% else %}
+<audio controls autoplay src="{{src}}#t={{t}}"></audio>
+{% endif %}
+<p><a href="/">← Back to search</a></p>
+"""
+
+# ---------- Helpers ----------
 def highlight(text: str, q: str) -> str:
     safe = html.escape(text)
     if not q:
@@ -80,15 +105,48 @@ def highlight(text: str, q: str) -> str:
         return pattern.sub(lambda m: f"<mark class='hit'>{m.group(0)}</mark>", safe)
     except Exception:
         return safe
-    
-def semantic_scores(query: str, docs, embs):
-    if not query or embs is None or SEM_MODEL is None:
-        return None  # semantic disabled if no embeddings
-    q = SEM_MODEL.encode([query], convert_to_numpy=True, normalize_embeddings=True)[0]
-    sims = (embs @ q)  # cosine because both normalized
-    # return list of (score, index_in_docs)
-    return sims
 
+def is_video_file(path: str) -> bool:
+    return path.lower().endswith((".mp4", ".mov", ".mkv", ".webm"))
+
+def load_resources():
+    data = {"docs": []}
+    if INDEX_PATH.exists():
+        data = orjson.loads(INDEX_PATH.read_bytes())
+    embs = None
+    if EMB_PATH.exists():
+        npz = np.load(EMB_PATH)
+        embs = npz["embeddings"]
+    model = None
+    if embs is not None:
+        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    return data, embs, model
+
+DATA, EMBEDDINGS, SEM_MODEL = load_resources()
+
+def semantic_scores(query: str, embs):
+    if not query or embs is None or SEM_MODEL is None:
+        return None
+    q = SEM_MODEL.encode([query], convert_to_numpy=True, normalize_embeddings=True)[0]
+    sims = (embs @ q)  # cosine in [-1,1]
+    return ((sims + 1.0) * 0.5)  # map to [0,1]
+
+def early_bonus(start_sec: float) -> float:
+    return CFG["EARLY_BONUS"] if start_sec <= CFG["EARLY_TIME_BONUS_SEC"] else 0.0
+
+def merge_context_indices(docs, hit_idx, before, after):
+    """
+    Return indices around hit within the same file, ordered by start time.
+    """
+    base = docs[hit_idx]
+    fname = base["media_relpath"]
+    s = max(0, hit_idx - before)
+    e = min(len(docs) - 1, hit_idx + after)
+    chosen = [i for i in range(s, e + 1) if docs[i]["media_relpath"] == fname]
+    chosen.sort(key=lambda i: float(docs[i]["start"]))
+    return chosen
+
+# ---------- Routes ----------
 @app.route("/")
 def home():
     q = (request.args.get("q") or "").strip()
@@ -97,81 +155,96 @@ def home():
     if q:
         qnorm = q.lower()
 
-        # --- keyword scores (0..1) ---
+        # Keyword scoring (0..1)
         kw_scores = []
         for d in docs:
             tn = d["text_norm"]
             pos = tn.find(qnorm)
-            if pos != -1:
-                # exact keyword hit → stronger score if earlier in segment text
-                kw = max(0.6, 1.0 / (1.0 + pos))  # clamp min to boost matches
-            else:
-                kw = 0.0
+            kw = max(0.6, 1.0 / (1.0 + pos)) if pos != -1 else 0.0
             kw_scores.append(kw)
 
-        # --- semantic scores (normalize to 0..1) ---
-        sem_sims = semantic_scores(q, docs, EMBEDDINGS)
-        sem_scores = []
-        if sem_sims is not None:
-            # sem_sims is cosine in [-1,1] → map to [0,1]
-            sem_scores = ((sem_sims + 1.0) * 0.5).tolist()
-        else:
+        # Semantic scoring (0..1)
+        sem_arr = semantic_scores(q, EMBEDDINGS)
+        if sem_arr is None:
             sem_scores = [0.0] * len(docs)
+        else:
+            sem_scores = sem_arr.tolist()
 
-        # --- combine & filter with thresholds ---
+        # Combine, threshold, and apply early bonus
         combined = []
         for i, d in enumerate(docs):
-            kw = kw_scores[i]
-            sem = sem_scores[i]
-            # if there's no keyword match, require a higher semantic minimum
-            if kw == 0.0 and sem < MIN_SEM:
+            kw = float(kw_scores[i])
+            sem = float(sem_scores[i])
+            if kw == 0.0 and sem < CFG["MIN_SEM"]:
                 continue
-            total = SEM_WEIGHT * sem + KW_WEIGHT * kw
-            if total < MIN_TOTAL and kw == 0.0:
+            total = CFG["SEM_WEIGHT"] * sem + CFG["KW_WEIGHT"] * kw + early_bonus(float(d["start"]))
+            if total < CFG["MIN_TOTAL"] and kw == 0.0:
                 continue
             combined.append((total, i, d))
 
-        # sort best-first
         combined.sort(key=lambda x: x[0], reverse=True)
 
-        # --- windowed suppression: keep best hit per 20s window per file ---
+        # Window suppression per file
         kept = []
-        last_kept_by_file = {}  # file -> list of (start_time, score)
+        last_by_file = {}  # file -> list[(start, score)]
         for total, i, d in combined:
             fname = d["media_relpath"]
             start = float(d["start"])
             ok = True
-            if fname in last_kept_by_file:
-                for s_prev, sc_prev in last_kept_by_file[fname]:
-                    if abs(start - s_prev) <= WIN_SECONDS:
-                        # already have a hit in this window; keep the stronger one
+            if fname in last_by_file:
+                for s_prev, sc_prev in list(last_by_file[fname]):
+                    if abs(start - s_prev) <= CFG["WIN_SECONDS"]:
                         if total <= sc_prev:
                             ok = False
                         else:
-                            # replace the weaker one
-                            last_kept_by_file[fname].remove((s_prev, sc_prev))
+                            last_by_file[fname].remove((s_prev, sc_prev))
                         break
             if ok:
-                last_kept_by_file.setdefault(fname, []).append((start, total))
+                last_by_file.setdefault(fname, []).append((start, total))
                 kept.append((total, i, d))
-            if len(kept) >= TOP_K:
+            if len(kept) >= CFG["TOP_K"]:
                 break
 
-        # build UI results
+        # Build UI results with context merge
         results = []
         for total, i, d in kept:
+            idxs = merge_context_indices(docs, i, CFG["CONTEXT_BEFORE"], CFG["CONTEXT_AFTER"])
             media_rel = d["media_relpath"].replace("\\", "/")
-            start = round(float(d["start"]), 2)
+            start = round(float(docs[idxs[0]]["start"]), 2)
+            end = round(float(docs[idxs[-1]]["end"]), 2)
             play_url = f"{MEDIA_BASE_URL}{media_rel}#t={start}"
+            # captions path (optional)
+            vtt_name = Path(d["media_file"]).stem + ".vtt"
+            vtt_path = CAPTIONS_DIR / vtt_name
             results.append({
                 "media_file": d["media_file"],
                 "start": start,
-                "end": round(float(d["end"]), 2),
-                "snippet": highlight(d["text"], q),
+                "end": end,
+                "snippet": highlight(" … ".join([docs[j]["text"] for j in idxs]), q),
                 "play_url": play_url,
+                "deep_link": f"/play?f={media_rel}&t={start}",
+                "captions": f"/captions/{vtt_name}" if vtt_path.exists() else None,
             })
 
     return render_template_string(HTML_TMPL, q=q, results=results)
 
+@app.route("/play")
+def play():
+    fname = request.args.get("f")
+    t = request.args.get("t", "0")
+    if not fname:
+        return "Missing f= (file path)", 400
+    src = f"{MEDIA_BASE_URL}{fname}"
+    vtt = f"/captions/{Path(fname).stem}.vtt"
+    return render_template_string(
+        PLAYER_TMPL,
+        fname=fname,
+        t=t,
+        src=src,
+        is_video=is_video_file(fname),
+        vtt=vtt,
+    )
+
+# ---------- Main ----------
 if __name__ == "__main__":
     app.run(debug=True)

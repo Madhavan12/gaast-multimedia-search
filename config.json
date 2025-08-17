@@ -1,0 +1,12 @@
+{
+  "TOP_K": 5,
+  "WIN_SECONDS": 30.0,
+  "MIN_TOTAL": 0.25,
+  "MIN_SEM": 0.40,
+  "KW_WEIGHT": 0.45,
+  "SEM_WEIGHT": 0.55,
+  "CONTEXT_BEFORE": 1,
+  "CONTEXT_AFTER": 1,
+  "EARLY_TIME_BONUS_SEC": 60.0,
+  "EARLY_BONUS": 0.05
+}

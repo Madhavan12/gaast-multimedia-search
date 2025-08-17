@@ -1,0 +1,5 @@
+[
+  {"q":"lift", "expect":["training.mp4#62-75"]},
+  {"q":"parasite drag", "expect":["training.mp4#173-212"]},
+  {"q":"thrust equals drag", "expect":["training.mp4#324-334"]}
+]
